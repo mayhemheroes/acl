@@ -1,5 +1,5 @@
 project: acl
-target: acl
+target: acl-compressor
 
 cmds:
   - cmd: /repo/build/tools/acl_compressor/main_generic/acl_compressor -acl=/test.acl
