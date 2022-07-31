@@ -2,6 +2,7 @@ project: acl
 target: acl-compressor
 
 cmds:
-  - cmd: /install/bin/acl_compressor -acl=@@
+  - cmd: /install/bin/acl_compressor -acl=/test.acl
+    filepath: /test.acl
     env:
       DISABLE_SMOKETEST: '1'
