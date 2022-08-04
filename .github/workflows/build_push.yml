@@ -10,33 +10,59 @@ on:
 
 jobs:
   linux:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        compiler: [gcc10, clang11]
+        compiler: [gcc11, clang14]
     steps:
       - name: Git checkout
         uses: actions/checkout@v2
         with:
           submodules: 'recursive'
-      - name: Setup ${{ matrix.compiler }} compiler
-        run: ./tools/setup_linux_compiler.sh ${{ matrix.compiler }}
       - name: Building (release-x86)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x86 -build
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x86 -build'
       - name: Running unit tests (release-x86)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x86 -unit_test
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x86 -unit_test'
       - name: Clean
-        run: python3 make.py -ci -clean_only
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -clean_only'
       - name: Building (release-x64)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -build
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -build'
       - name: Running unit tests (release-x64)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -unit_test
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -unit_test'
       - name: Clean
-        run: python3 make.py -ci -clean_only
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -clean_only'
       - name: Building (release-x64 nosimd)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -nosimd -build
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -nosimd -build'
       - name: Running unit tests (release-x64 nosimd)
-        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -nosimd -unit_test
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -nosimd -unit_test'
+      - name: Clean
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -clean_only'
+      - name: Building (release-x64 AVX)
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -avx -build'
+      - name: Running unit tests (release-x64 AVX)
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-focal:v1
+        with:
+          args: 'python3 make.py -ci -compiler ${{ matrix.compiler }} -config Release -cpu x64 -avx -unit_test'
 
   osx-11:
     runs-on: macos-11
@@ -70,31 +96,42 @@ jobs:
         run: python3 make.py -ci -compiler ios -config Release -build -nosimd
 
   emscripten:
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-latest
     steps:
       - name: Git checkout
         uses: actions/checkout@v2
         with:
           submodules: 'recursive'
-      - name: Cache emsdk
-        uses: actions/cache@v1
-        id: 'emsdk'
-        with:
-          path: 'emsdk-cache'
-          key: ${{ runner.os }}-emsdk-1.39.11
-      - name: Setup emsdk
-        uses: mymindstorm/setup-emsdk@v7
-        with:
-          version: 1.39.11
-          no-cache: true
-          actions-cache-folder: 'emsdk-cache'
-      - name: Cache emsdk build artifacts
-        uses: actions/cache@v1
-        id: 'emsdk-build-artifacts'
-        with:
-          path: '~/.emscripten_cache'
-          key: ${{ runner.os }}-emsdk-build-artifacts-1.39.11
       - name: Build (release)
-        run: python3 make.py -ci -compiler emscripten -config release -build
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-linux-emscripten:v1
+        with:
+          args: 'python3 make.py -ci -compiler emscripten -config release -build'
       - name: Unit tests (release)
-        run: python3 make.py -ci -compiler emscripten -config release -unit_test
+        uses: docker://ghcr.io/nfrechette/toolchain-amd64-linux-emscripten:v1
+        with:
+          args: 'python3 make.py -ci -compiler emscripten -config release -unit_test'
+
+  vs2022:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        compiler: [vs2022, vs2022-clang]
+        build_config: [debug, release]
+        cpu: [x86, x64, arm64]
+        simd: [-simd, -nosimd, -avx]
+        exclude:
+          # Don't run arm64 with clang
+          - compiler: vs2022-clang
+            cpu: arm64
+          # Don't run AVX with arm64
+          - cpu: arm64
+            simd: -avx
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+      - name: Building (${{ matrix.build_config }}-${{ matrix.cpu }})
+        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config ${{ matrix.build_config }} -cpu ${{ matrix.cpu }} -build ${{ matrix.simd }}
+      - name: Running unit tests (${{ matrix.build_config }}-${{ matrix.cpu }})
+        run: python3 make.py -ci -compiler ${{ matrix.compiler }} -config ${{ matrix.build_config }} -cpu ${{ matrix.cpu }} -unit_test ${{ matrix.simd }}

@@ -33,7 +33,7 @@ def parse_argv():
 	actions.add_argument('-convert', help='Input/Output directory to convert')
 
 	target = parser.add_argument_group(title='Target')
-	target.add_argument('-compiler', choices=['vs2015', 'vs2017', 'vs2019', 'vs2019-clang', 'android', 'clang4', 'clang5', 'clang6', 'clang7', 'clang8', 'clang9', 'clang10', 'clang11', 'gcc5', 'gcc6', 'gcc7', 'gcc8', 'gcc9', 'gcc10', 'osx', 'ios', 'emscripten'], help='Defaults to the host system\'s default compiler')
+	target.add_argument('-compiler', choices=['vs2015', 'vs2017', 'vs2019', 'vs2022', 'vs2019-clang', 'vs2022-clang', 'android', 'clang4', 'clang5', 'clang6', 'clang7', 'clang8', 'clang9', 'clang10', 'clang11', 'clang12', 'clang13', 'clang14', 'gcc5', 'gcc6', 'gcc7', 'gcc8', 'gcc9', 'gcc10', 'gcc11', 'osx', 'ios', 'emscripten'], help='Defaults to the host system\'s default compiler')
 	target.add_argument('-config', choices=['Debug', 'Release'], type=str.capitalize)
 	target.add_argument('-cpu', choices=['x86', 'x64', 'armv7', 'arm64', 'wasm'], help='Defaults to the host system\'s architecture')
 
@@ -41,6 +41,7 @@ def parse_argv():
 	misc.add_argument('-avx', dest='use_avx', action='store_true', help='Compile using AVX instructions on Windows, OS X, and Linux')
 	misc.add_argument('-pop', dest='use_popcnt', action='store_true', help='Compile using the POPCNT instruction')
 	misc.add_argument('-nosimd', dest='use_simd', action='store_false', help='Compile without SIMD instructions')
+	misc.add_argument('-simd', dest='use_simd', action='store_true', help='Compile with default SIMD instructions')
 	misc.add_argument('-nosjson', dest='use_sjson', action='store_false', help='Compile without SJSON support')
 	misc.add_argument('-num_threads', help='No. to use while compiling and regressing')
 	misc.add_argument('-tests_matching', help='Only run tests whose names match this regex')
@@ -128,7 +129,7 @@ def parse_argv():
 		is_arm_supported = False
 
 		# Cross compilation
-		if args.compiler in ['vs2017', 'vs2019', 'ios', 'android']:
+		if args.compiler in ['vs2017', 'vs2019', 'vs2022', 'ios', 'android']:
 			is_arm_supported = True
 
 		# Native compilation
@@ -178,6 +179,8 @@ def get_generator(compiler, cpu):
 				return 'Visual Studio 15 2017'
 		elif compiler == 'vs2019' or compiler == 'vs2019-clang':
 			return 'Visual Studio 16 2019'
+		elif compiler == 'vs2022' or compiler == 'vs2022-clang':
+			return 'Visual Studio 17 2022'
 		elif compiler == 'android':
 			# For Android, we use the default generator since we don't build with CMake
 			return None
@@ -206,7 +209,14 @@ def get_architecture(compiler, cpu):
 		if compiler == 'vs2017':
 			if cpu == 'arm64':
 				return 'ARM64'
-		elif compiler == 'vs2019' or compiler == 'vs2019-clang':
+
+		is_modern_vs = False
+		if compiler == 'vs2019' or compiler == 'vs2019-clang':
+			is_modern_vs = True
+		elif compiler == 'vs2022' or compiler == 'vs2022-clang':
+			is_modern_vs = True
+
+		if is_modern_vs:
 			if cpu == 'x86':
 				return 'Win32'
 			else:
@@ -250,6 +260,15 @@ def set_compiler_env(compiler, args):
 		elif compiler == 'clang11':
 			os.environ['CC'] = 'clang-11'
 			os.environ['CXX'] = 'clang++-11'
+		elif compiler == 'clang12':
+			os.environ['CC'] = 'clang-12'
+			os.environ['CXX'] = 'clang++-12'
+		elif compiler == 'clang13':
+			os.environ['CC'] = 'clang-13'
+			os.environ['CXX'] = 'clang++-13'
+		elif compiler == 'clang14':
+			os.environ['CC'] = 'clang-14'
+			os.environ['CXX'] = 'clang++-14'
 		elif compiler == 'gcc5':
 			os.environ['CC'] = 'gcc-5'
 			os.environ['CXX'] = 'g++-5'
@@ -268,6 +287,9 @@ def set_compiler_env(compiler, args):
 		elif compiler == 'gcc10':
 			os.environ['CC'] = 'gcc-10'
 			os.environ['CXX'] = 'g++-10'
+		elif compiler == 'gcc11':
+			os.environ['CC'] = 'gcc-11'
+			os.environ['CXX'] = 'g++-11'
 		elif compiler == 'emscripten':
 			# Nothing to do for Emscripten
 			return
@@ -334,7 +356,7 @@ def do_generate_solution(build_dir, cmake_script_dir, test_data_dir, decomp_data
 			print('Using default generator')
 		else:
 			generator_suffix = ''
-			if compiler == 'vs2019-clang':
+			if compiler == 'vs2019-clang' or compiler == 'vs2022-clang':
 				extra_switches.append('-T ClangCL')
 				generator_suffix = 'Clang CL'
 

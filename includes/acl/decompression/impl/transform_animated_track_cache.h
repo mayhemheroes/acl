@@ -321,11 +321,12 @@ namespace acl
 			segment_range_min_zzzz = _mm_andnot_ps(segment_range_ignore_mask_v, segment_range_min_zzzz);
 #elif defined(RTM_NEON_INTRINSICS)
 			// Mask out the segment min we ignore
-			const uint32x4_t segment_range_ignore_mask_v = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(range_reduction_masks)));
+			const uint32x4_t segment_range_ignore_mask_vu32 = vreinterpretq_u32_s32(vmovl_s16(vget_low_s16(range_reduction_masks)));
+			const float32x4_t segment_range_ignore_mask_v = vreinterpretq_f32_u32(segment_range_ignore_mask_vu32);
 
-			segment_range_min_xxxx = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_xxxx), segment_range_ignore_mask_v));
-			segment_range_min_yyyy = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_yyyy), segment_range_ignore_mask_v));
-			segment_range_min_zzzz = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_zzzz), segment_range_ignore_mask_v));
+			segment_range_min_xxxx = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_xxxx), segment_range_ignore_mask_vu32));
+			segment_range_min_yyyy = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_yyyy), segment_range_ignore_mask_vu32));
+			segment_range_min_zzzz = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(segment_range_min_zzzz), segment_range_ignore_mask_vu32));
 #else
 			const rtm::vector4f zero_v = rtm::vector_zero();
 
@@ -515,10 +516,12 @@ namespace acl
 		// Force inline this function, we only use it to keep the code readable
 		RTM_FORCE_INLINE RTM_DISABLE_SECURITY_COOKIE_CHECK rtm::vector4f RTM_SIMD_CALL quat_from_positive_w4(rtm::vector4f_arg0 xxxx, rtm::vector4f_arg1 yyyy, rtm::vector4f_arg2 zzzz)
 		{
-			const rtm::vector4f xxxx_squared = rtm::vector_mul(xxxx, xxxx);
-			const rtm::vector4f yyyy_squared = rtm::vector_mul(yyyy, yyyy);
-			const rtm::vector4f zzzz_squared = rtm::vector_mul(zzzz, zzzz);
-			const rtm::vector4f wwww_squared = rtm::vector_sub(rtm::vector_sub(rtm::vector_sub(rtm::vector_set(1.0F), xxxx_squared), yyyy_squared), zzzz_squared);
+			// 1.0 - (x * x)
+			rtm::vector4f result = rtm::vector_neg_mul_sub(xxxx, xxxx, rtm::vector_set(1.0F));
+			// result - (y * y)
+			result = rtm::vector_neg_mul_sub(yyyy, yyyy, result);
+			// result - (z * z)
+			const rtm::vector4f wwww_squared = rtm::vector_neg_mul_sub(zzzz, zzzz, result);
 
 			// w_squared can be negative either due to rounding or due to quantization imprecision, we take the absolute value
 			// to ensure the resulting quaternion is always normalized with a positive W component

@@ -1,5 +1,21 @@
 # Significant changes per release
 
+## 2.0.6
+
+*  Force macro expansion in version namespace identifier
+*  Update to RTM v2.1.5
+*  Update sjson-cpp to v0.8.3
+
+## 2.0.5
+
+*  Add support for clang 12, 13, and 14
+*  Add support for GCC 11
+*  Add support for XCode 12 and 13
+*  Add support for Arm64 development on OS X and Linux
+*  Misc CI improvements
+*  Update to RTM v2.1.4
+*  Update to Catch2 v2.13.7
+
 ## 2.0.4
 
 *  Disable versioned namespace by default to avoid breaking ABI in patch release
