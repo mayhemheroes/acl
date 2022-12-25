@@ -59,7 +59,8 @@ jobs:
       fail-fast: false
       matrix:
         mayhemfile:
-          - mayhem/Mayhemfile
+          - mayhem/Mayhemfile_hash32
+          - mayhem/Mayhemfile_acl_compressor
 
     steps:
       - uses: actions/checkout@v3
