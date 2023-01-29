@@ -39,6 +39,7 @@
 #include "acl/compression/impl/sample_streams.h"
 #include "acl/compression/impl/normalize_streams.h"
 #include "acl/compression/impl/convert_rotation_streams.h"
+#include "acl/compression/impl/rigid_shell_utils.h"
 #include "acl/compression/transform_error_metrics.h"
 #include "acl/compression/compression_settings.h"
 
@@ -53,8 +54,14 @@
 #include <cstdint>
 #include <functional>
 
-// 0 = no debug info, 1 = basic info, 2 = verbose
-#define ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION		0
+#define ACL_IMPL_DEBUG_LEVEL_NONE					0
+#define ACL_IMPL_DEBUG_LEVEL_SUMMARY_ONLY			1
+#define ACL_IMPL_DEBUG_LEVEL_BASIC_INFO				2
+#define ACL_IMPL_DEBUG_LEVEL_VERBOSE_INFO			3
+
+// Dumps details of quantization optimization process
+// Use debug levels above to control debug output
+#define ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION		ACL_IMPL_DEBUG_LEVEL_NONE
 
 // 0 = no debug into, 1 = basic info
 #define ACL_IMPL_DEBUG_CONTRIBUTING_ERROR			0
@@ -95,7 +102,6 @@ namespace acl
 			uint32_t segment_sample_start_index;
 			float sample_rate;
 			float clip_duration;
-			float error_threshold;					// Error threshold of the current bone being optimized
 			bool has_scale;
 			bool has_additive_base;
 			bool needs_conversion;
@@ -106,6 +112,8 @@ namespace acl
 			compression_level8 compression_level;
 
 			const transform_streams* raw_bone_streams;
+
+			rigid_shell_metadata_t* shell_metadata_per_transform;	// 1 per transform
 
 			rtm::qvvf* additive_local_pose;			// 1 per transform
 			rtm::qvvf* raw_local_pose;				// 1 per transform
@@ -149,7 +157,6 @@ namespace acl
 				, segment_sample_start_index(~0U)
 				, sample_rate(clip_.sample_rate)
 				, clip_duration(clip_.duration)
-				, error_threshold(0.0F)
 				, has_scale(clip_.has_scale)
 				, has_additive_base(clip_.has_additive_base)
 				, rotation_format(settings_.rotation_format)
@@ -168,6 +175,7 @@ namespace acl
 				const size_t metric_transform_size_ = settings_.error_metric->get_transform_size(clip_.has_scale);
 				metric_transform_size = metric_transform_size_;
 
+				shell_metadata_per_transform = allocate_type_array<rigid_shell_metadata_t>(allocator, num_bones);
 				additive_local_pose = clip_.has_additive_base ? allocate_type_array<rtm::qvvf>(allocator, num_bones) : nullptr;
 				raw_local_pose = allocate_type_array<rtm::qvvf>(allocator, num_bones);
 				lossy_local_pose = allocate_type_array<rtm::qvvf>(allocator, num_bones);
@@ -192,6 +200,7 @@ namespace acl
 
 			~quantization_context()
 			{
+				deallocate_type_array(allocator, shell_metadata_per_transform, num_bones);
 				deallocate_type_array(allocator, additive_local_pose, num_bones);
 				deallocate_type_array(allocator, raw_local_pose, num_bones);
 				deallocate_type_array(allocator, lossy_local_pose, num_bones);
@@ -216,6 +225,9 @@ namespace acl
 				num_samples = segment_.num_samples;
 				segment_sample_start_index = segment_.clip_sample_offset;
 				bit_rate_database.set_segment(segment_.bone_streams, segment_.num_bones, segment_.num_samples);
+
+				// Update our shell distances
+				compute_segment_shell_distances(segment_, additive_base_clip, shell_metadata_per_transform);
 
 				// Cache every raw local/object transforms and the base local transforms since they never change
 				const itransform_error_metric* error_metric_ = error_metric;
@@ -342,26 +354,26 @@ namespace acl
 			quantize_fixed_rotation_stream(context.allocator, bone_stream.rotations, rotation_format, bone_stream.rotations);
 		}
 
-		inline void quantize_variable_rotation_stream(quantization_context& context, const rotation_track_stream& raw_clip_stream, const rotation_track_stream& raw_segment_stream, const track_stream_range& clip_range, uint8_t bit_rate, rotation_track_stream& out_quantized_stream)
+		inline void quantize_variable_rotation_stream(quantization_context& context, const transform_streams& raw_track, const transform_streams& lossy_track, uint8_t bit_rate, rotation_track_stream& out_quantized_stream)
 		{
-			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
-			ACL_ASSERT(raw_segment_stream.get_sample_size() == sizeof(rtm::vector4f), "Unexpected rotation sample size. %u != %zu", raw_segment_stream.get_sample_size(), sizeof(rtm::vector4f));
+			const rotation_track_stream& raw_rotations = raw_track.rotations;
+			const rotation_track_stream& lossy_rotations = lossy_track.rotations;
 
-			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : raw_segment_stream.get_num_samples();
+			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
+			ACL_ASSERT(lossy_rotations.get_sample_size() == sizeof(rtm::vector4f), "Unexpected rotation sample size. %u != %zu", lossy_rotations.get_sample_size(), sizeof(rtm::vector4f));
+
+			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : lossy_rotations.get_num_samples();
 			const uint32_t sample_size = sizeof(uint64_t) * 2;
-			const float sample_rate = raw_segment_stream.get_sample_rate();
+			const float sample_rate = lossy_rotations.get_sample_rate();
 			rotation_track_stream quantized_stream(context.allocator, num_samples, sample_size, sample_rate, rotation_format8::quatf_drop_w_variable, bit_rate);
 
 			if (is_constant_bit_rate(bit_rate))
 			{
-
 #if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
+				const track_stream_range& bone_range = context.segment->ranges[lossy_track.bone_index].rotation;
 				const rtm::vector4f normalized_rotation = clip_range.get_weighted_average();
 #else
-				rtm::vector4f rotation = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index);
-				rotation = convert_rotation(rotation, rotation_format8::quatf_full, rotation_format8::quatf_drop_w_variable);
-
-				const rtm::vector4f normalized_rotation = normalize_sample(rotation, clip_range);
+				const rtm::vector4f normalized_rotation = lossy_track.constant_rotation;
 #endif
 
 				uint8_t* quantized_ptr = quantized_stream.get_raw_sample_ptr(0);
@@ -377,13 +389,13 @@ namespace acl
 
 					if (is_raw_bit_rate(bit_rate))
 					{
-						rtm::vector4f rotation = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
+						rtm::vector4f rotation = raw_rotations.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
 						rotation = convert_rotation(rotation, rotation_format8::quatf_full, rotation_format8::quatf_drop_w_variable);
 						pack_vector3_96(rotation, quantized_ptr);
 					}
 					else
 					{
-						const rtm::quatf rotation = raw_segment_stream.get_raw_sample<rtm::quatf>(sample_index);
+						const rtm::quatf rotation = lossy_rotations.get_raw_sample<rtm::quatf>(sample_index);
 						pack_vector3_uXX_unsafe(rtm::quat_to_vector(rotation), num_bits_at_bit_rate, quantized_ptr);
 					}
 				}
@@ -396,26 +408,20 @@ namespace acl
 		{
 			ACL_ASSERT(bone_index < context.num_bones, "Invalid bone index: %u", bone_index);
 
-			transform_streams& bone_stream = context.bone_streams[bone_index];
+			transform_streams& lossy_track = context.bone_streams[bone_index];
 
 			// Default tracks aren't quantized
-			if (bone_stream.is_rotation_default)
+			if (lossy_track.is_rotation_default)
 				return;
 
-			const transform_streams& raw_bone_stream = context.raw_bone_streams[bone_index];
+			const transform_streams& raw_track = context.raw_bone_streams[bone_index];
 			const rotation_format8 highest_bit_rate = get_highest_variant_precision(rotation_variant8::quat_drop_w);
 
-#if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
-			const track_stream_range& bone_range = context.segment->ranges[bone_index].rotation;
-#else
-			const track_stream_range& bone_range = context.clip.ranges[bone_index].rotation;
-#endif
-
 			// If our format is variable, we keep them fixed at the highest bit rate in the variant
-			if (bone_stream.is_rotation_constant)
-				quantize_fixed_rotation_stream(context.allocator, bone_stream.rotations, highest_bit_rate, bone_stream.rotations);
+			if (lossy_track.is_rotation_constant)
+				quantize_fixed_rotation_stream(context.allocator, lossy_track.rotations, highest_bit_rate, lossy_track.rotations);
 			else
-				quantize_variable_rotation_stream(context, raw_bone_stream.rotations, bone_stream.rotations, bone_range, bit_rate, bone_stream.rotations);
+				quantize_variable_rotation_stream(context, raw_track, lossy_track, bit_rate, lossy_track.rotations);
 		}
 
 		inline void quantize_fixed_translation_stream(iallocator& allocator, const translation_track_stream& raw_stream, vector_format8 translation_format, translation_track_stream& out_quantized_stream)
@@ -465,25 +471,27 @@ namespace acl
 			quantize_fixed_translation_stream(context.allocator, bone_stream.translations, format, bone_stream.translations);
 		}
 
-		inline void quantize_variable_translation_stream(quantization_context& context, const translation_track_stream& raw_clip_stream, const translation_track_stream& raw_segment_stream, const track_stream_range& clip_range, uint8_t bit_rate, translation_track_stream& out_quantized_stream)
+		inline void quantize_variable_translation_stream(quantization_context& context, const transform_streams& raw_track, const transform_streams& lossy_track, uint8_t bit_rate, translation_track_stream& out_quantized_stream)
 		{
-			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
-			ACL_ASSERT(raw_segment_stream.get_sample_size() == sizeof(rtm::vector4f), "Unexpected translation sample size. %u != %zu", raw_segment_stream.get_sample_size(), sizeof(rtm::vector4f));
-			ACL_ASSERT(raw_segment_stream.get_vector_format() == vector_format8::vector3f_full, "Expected a vector3f_full vector format, found: %s", get_vector_format_name(raw_segment_stream.get_vector_format()));
+			const translation_track_stream& raw_translations = raw_track.translations;
+			const translation_track_stream& lossy_translations = lossy_track.translations;
 
-			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : raw_segment_stream.get_num_samples();
+			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
+			ACL_ASSERT(lossy_translations.get_sample_size() == sizeof(rtm::vector4f), "Unexpected translation sample size. %u != %zu", lossy_translations.get_sample_size(), sizeof(rtm::vector4f));
+			ACL_ASSERT(lossy_translations.get_vector_format() == vector_format8::vector3f_full, "Expected a vector3f_full vector format, found: %s", get_vector_format_name(lossy_translations.get_vector_format()));
+
+			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : lossy_translations.get_num_samples();
 			const uint32_t sample_size = sizeof(uint64_t) * 2;
-			const float sample_rate = raw_segment_stream.get_sample_rate();
+			const float sample_rate = lossy_translations.get_sample_rate();
 			translation_track_stream quantized_stream(context.allocator, num_samples, sample_size, sample_rate, vector_format8::vector3f_variable, bit_rate);
 
 			if (is_constant_bit_rate(bit_rate))
 			{
-
 #if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
+				const track_stream_range& bone_range = context.segment->ranges[lossy_track.bone_index].translation;
 				const rtm::vector4f normalized_translation = clip_range.get_weighted_average();
 #else
-				const rtm::vector4f translation = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index);
-				const rtm::vector4f normalized_translation = normalize_sample(translation, clip_range);
+				const rtm::vector4f normalized_translation = lossy_track.constant_translation;
 #endif
 
 				uint8_t* quantized_ptr = quantized_stream.get_raw_sample_ptr(0);
@@ -499,12 +507,12 @@ namespace acl
 
 					if (is_raw_bit_rate(bit_rate))
 					{
-						const rtm::vector4f translation = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
+						const rtm::vector4f translation = raw_translations.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
 						pack_vector3_96(translation, quantized_ptr);
 					}
 					else
 					{
-						const rtm::vector4f translation = raw_segment_stream.get_raw_sample<rtm::vector4f>(sample_index);
+						const rtm::vector4f translation = lossy_translations.get_raw_sample<rtm::vector4f>(sample_index);
 						pack_vector3_uXX_unsafe(translation, num_bits_at_bit_rate, quantized_ptr);
 					}
 				}
@@ -517,25 +525,19 @@ namespace acl
 		{
 			ACL_ASSERT(bone_index < context.num_bones, "Invalid bone index: %u", bone_index);
 
-			transform_streams& bone_stream = context.bone_streams[bone_index];
+			transform_streams& lossy_track = context.bone_streams[bone_index];
 
 			// Default tracks aren't quantized
-			if (bone_stream.is_translation_default)
+			if (lossy_track.is_translation_default)
 				return;
 
-#if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
-			const track_stream_range& bone_range = context.segment->ranges[bone_index].translation;
-#else
-			const track_stream_range& bone_range = context.clip.ranges[bone_index].translation;
-#endif
-
-			const transform_streams& raw_bone_stream = context.raw_bone_streams[bone_index];
+			const transform_streams& raw_track = context.raw_bone_streams[bone_index];
 
 			// Constant translation tracks store the remaining sample with full precision
-			if (bone_stream.is_translation_constant)
-				quantize_fixed_translation_stream(context.allocator, bone_stream.translations, vector_format8::vector3f_full, bone_stream.translations);
+			if (lossy_track.is_translation_constant)
+				quantize_fixed_translation_stream(context.allocator, lossy_track.translations, vector_format8::vector3f_full, lossy_track.translations);
 			else
-				quantize_variable_translation_stream(context, raw_bone_stream.translations, bone_stream.translations, bone_range, bit_rate, bone_stream.translations);
+				quantize_variable_translation_stream(context, raw_track, lossy_track, bit_rate, lossy_track.translations);
 		}
 
 		inline void quantize_fixed_scale_stream(iallocator& allocator, const scale_track_stream& raw_stream, vector_format8 scale_format, scale_track_stream& out_quantized_stream)
@@ -585,24 +587,27 @@ namespace acl
 			quantize_fixed_scale_stream(context.allocator, bone_stream.scales, format, bone_stream.scales);
 		}
 
-		inline void quantize_variable_scale_stream(quantization_context& context, const scale_track_stream& raw_clip_stream, const scale_track_stream& raw_segment_stream, const track_stream_range& clip_range, uint8_t bit_rate, scale_track_stream& out_quantized_stream)
+		inline void quantize_variable_scale_stream(quantization_context& context, const transform_streams& raw_track, const transform_streams& lossy_track, uint8_t bit_rate, scale_track_stream& out_quantized_stream)
 		{
-			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
-			ACL_ASSERT(raw_segment_stream.get_sample_size() == sizeof(rtm::vector4f), "Unexpected scale sample size. %u != %zu", raw_segment_stream.get_sample_size(), sizeof(rtm::vector4f));
-			ACL_ASSERT(raw_segment_stream.get_vector_format() == vector_format8::vector3f_full, "Expected a vector3f_full vector format, found: %s", get_vector_format_name(raw_segment_stream.get_vector_format()));
+			const scale_track_stream& raw_scales = raw_track.scales;
+			const scale_track_stream& lossy_scales = lossy_track.scales;
 
-			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : raw_segment_stream.get_num_samples();
+			// We expect all our samples to have the same width of sizeof(rtm::vector4f)
+			ACL_ASSERT(lossy_scales.get_sample_size() == sizeof(rtm::vector4f), "Unexpected scale sample size. %u != %zu", lossy_scales.get_sample_size(), sizeof(rtm::vector4f));
+			ACL_ASSERT(lossy_scales.get_vector_format() == vector_format8::vector3f_full, "Expected a vector3f_full vector format, found: %s", get_vector_format_name(lossy_scales.get_vector_format()));
+
+			const uint32_t num_samples = is_constant_bit_rate(bit_rate) ? 1 : lossy_scales.get_num_samples();
 			const uint32_t sample_size = sizeof(uint64_t) * 2;
-			const float sample_rate = raw_segment_stream.get_sample_rate();
+			const float sample_rate = lossy_scales.get_sample_rate();
 			scale_track_stream quantized_stream(context.allocator, num_samples, sample_size, sample_rate, vector_format8::vector3f_variable, bit_rate);
 
 			if (is_constant_bit_rate(bit_rate))
 			{
 #if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
+				const track_stream_range& bone_range = context.segment->ranges[lossy_track.bone_index].scale;
 				const rtm::vector4f normalized_scale = clip_range.get_weighted_average();
 #else
-				const rtm::vector4f scale = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index);
-				const rtm::vector4f normalized_scale = normalize_sample(scale, clip_range);
+				const rtm::vector4f normalized_scale = lossy_track.constant_scale;
 #endif
 
 				uint8_t* quantized_ptr = quantized_stream.get_raw_sample_ptr(0);
@@ -618,12 +623,12 @@ namespace acl
 
 					if (is_raw_bit_rate(bit_rate))
 					{
-						const rtm::vector4f scale = raw_clip_stream.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
+						const rtm::vector4f scale = raw_scales.get_raw_sample<rtm::vector4f>(context.segment_sample_start_index + sample_index);
 						pack_vector3_96(scale, quantized_ptr);
 					}
 					else
 					{
-						const rtm::vector4f scale = raw_segment_stream.get_raw_sample<rtm::vector4f>(sample_index);
+						const rtm::vector4f scale = lossy_scales.get_raw_sample<rtm::vector4f>(sample_index);
 						pack_vector3_uXX_unsafe(scale, num_bits_at_bit_rate, quantized_ptr);
 					}
 				}
@@ -636,25 +641,19 @@ namespace acl
 		{
 			ACL_ASSERT(bone_index < context.num_bones, "Invalid bone index: %u", bone_index);
 
-			transform_streams& bone_stream = context.bone_streams[bone_index];
+			transform_streams& lossy_track = context.bone_streams[bone_index];
 
 			// Default tracks aren't quantized
-			if (bone_stream.is_scale_default)
+			if (lossy_track.is_scale_default)
 				return;
 
-#if defined(ACL_IMPL_ENABLE_WEIGHTED_AVERAGE_CONSTANT_SUB_TRACKS)
-			const track_stream_range& bone_range = context.segment->ranges[bone_index].scale;
-#else
-			const track_stream_range& bone_range = context.clip.ranges[bone_index].scale;
-#endif
-
-			const transform_streams& raw_bone_stream = context.raw_bone_streams[bone_index];
+			const transform_streams& raw_track = context.raw_bone_streams[bone_index];
 
 			// Constant scale tracks store the remaining sample with full precision
-			if (bone_stream.is_scale_constant)
-				quantize_fixed_scale_stream(context.allocator, bone_stream.scales, vector_format8::vector3f_full, bone_stream.scales);
+			if (lossy_track.is_scale_constant)
+				quantize_fixed_scale_stream(context.allocator, lossy_track.scales, vector_format8::vector3f_full, lossy_track.scales);
 			else
-				quantize_variable_scale_stream(context, raw_bone_stream.scales, bone_stream.scales, bone_range, bit_rate, bone_stream.scales);
+				quantize_variable_scale_stream(context, raw_track, lossy_track, bit_rate, lossy_track.scales);
 		}
 
 		enum class error_scan_stop_condition { until_error_too_high, until_end_of_segment };
@@ -664,12 +663,11 @@ namespace acl
 			const itransform_error_metric* error_metric = context.error_metric;
 			const bool needs_conversion = context.needs_conversion;
 			const bool has_additive_base = context.has_additive_base;
-			const transform_metadata& target_bone = context.metadata[target_bone_index];
+
 			const uint32_t num_transforms = context.num_bones;
 			const size_t sample_transform_size = context.metric_transform_size * context.num_bones;
 			const float sample_rate = context.sample_rate;
 			const float clip_duration = context.clip_duration;
-			const rtm::scalarf error_threshold = rtm::scalar_set(context.error_threshold);
 
 			const auto convert_transforms_impl = std::mem_fn(context.has_scale ? &itransform_error_metric::convert_transforms : &itransform_error_metric::convert_transforms_no_scale);
 			const auto apply_additive_to_base_impl = std::mem_fn(context.has_scale ? &itransform_error_metric::apply_additive_to_base : &itransform_error_metric::apply_additive_to_base_no_scale);
@@ -691,7 +689,9 @@ namespace acl
 			itransform_error_metric::calculate_error_args calculate_error_args;
 			calculate_error_args.transform0 = nullptr;
 			calculate_error_args.transform1 = needs_conversion ? (const void*)(context.local_transforms_converted + (context.metric_transform_size * target_bone_index)) : (const void*)(context.lossy_local_pose + target_bone_index);
-			calculate_error_args.construct_sphere_shell(target_bone.shell_distance);
+
+			const rigid_shell_metadata_t& transform_shell = context.shell_metadata_per_transform[target_bone_index];
+			const rtm::scalarf error_threshold = rtm::scalar_set(transform_shell.precision);
 
 			const uint8_t* raw_transform = context.raw_local_transforms + (target_bone_index * context.metric_transform_size);
 			const uint8_t* base_transforms = context.base_local_transforms;
@@ -720,6 +720,7 @@ namespace acl
 					apply_additive_to_base_impl(error_metric, apply_additive_to_base_args_lossy, context.lossy_local_pose);
 				}
 
+				calculate_error_args.construct_sphere_shell(transform_shell.local_shell_distance);
 				calculate_error_args.transform0 = raw_transform;
 				raw_transform += sample_transform_size;
 
@@ -746,11 +747,10 @@ namespace acl
 			const itransform_error_metric* error_metric = context.error_metric;
 			const bool needs_conversion = context.needs_conversion;
 			const bool has_additive_base = context.has_additive_base;
-			const transform_metadata& target_bone = context.metadata[target_bone_index];
+
 			const size_t sample_transform_size = context.metric_transform_size * context.num_bones;
 			const float sample_rate = context.sample_rate;
 			const float clip_duration = context.clip_duration;
-			const rtm::scalarf error_threshold = rtm::scalar_set(context.error_threshold);
 
 			const auto convert_transforms_impl = std::mem_fn(context.has_scale ? &itransform_error_metric::convert_transforms : &itransform_error_metric::convert_transforms_no_scale);
 			const auto apply_additive_to_base_impl = std::mem_fn(context.has_scale ? &itransform_error_metric::apply_additive_to_base : &itransform_error_metric::apply_additive_to_base_no_scale);
@@ -780,7 +780,9 @@ namespace acl
 			itransform_error_metric::calculate_error_args calculate_error_args;
 			calculate_error_args.transform0 = nullptr;
 			calculate_error_args.transform1 = context.lossy_object_pose + (target_bone_index * context.metric_transform_size);
-			calculate_error_args.construct_sphere_shell(target_bone.shell_distance);
+
+			const rigid_shell_metadata_t& transform_shell = context.shell_metadata_per_transform[target_bone_index];
+			const rtm::scalarf error_threshold = rtm::scalar_set(transform_shell.precision);
 
 			const uint8_t* raw_transform = context.raw_object_transforms + (target_bone_index * context.metric_transform_size);
 			const uint8_t* base_transforms = context.base_local_transforms;
@@ -811,6 +813,7 @@ namespace acl
 
 				local_to_object_space_impl(error_metric, local_to_object_space_args_lossy, context.lossy_object_pose);
 
+				calculate_error_args.construct_sphere_shell(transform_shell.local_shell_distance);
 				calculate_error_args.transform0 = raw_transform;
 				raw_transform += sample_transform_size;
 
@@ -842,8 +845,7 @@ namespace acl
 			for (uint32_t bone_index = 0; bone_index < num_bones; ++bone_index)
 			{
 				// Update our error threshold
-				const float error_threshold = context.metadata[bone_index].precision;
-				context.error_threshold = error_threshold;
+				const float error_threshold = context.shell_metadata_per_transform[bone_index].precision;
 
 				// Bit rates at this point are one of three value:
 				// 0: if the segment track is normalized, it can be constant within the segment
@@ -853,7 +855,7 @@ namespace acl
 
 				if (bone_bit_rates.rotation == k_invalid_bit_rate && bone_bit_rates.translation == k_invalid_bit_rate && bone_bit_rates.scale == k_invalid_bit_rate)
 				{
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_BASIC_INFO
 					printf("%u: Best bit rates: %u | %u | %u\n", bone_index, bone_bit_rates.rotation, bone_bit_rates.translation, bone_bit_rates.scale);
 #endif
 					continue;	// Every track bit rate is constant/default, nothing else to do
@@ -924,7 +926,7 @@ namespace acl
 
 						const float error = calculate_max_error_at_bit_rate_local(context, bone_index, error_scan_stop_condition::until_error_too_high);
 
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION > 1
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_VERBOSE_INFO
 						printf("%u: %u | %u | %u (%u) = %f\n", bone_index, rotation_bit_rate, translation_bit_rate, scale_bit_rate, transform_size, error);
 #endif
 
@@ -982,7 +984,7 @@ namespace acl
 
 						const float error = calculate_max_error_at_bit_rate_local(context, bone_index, error_scan_stop_condition::until_error_too_high);
 
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION > 1
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_VERBOSE_INFO
 						printf("%u: %u | %u | %u (%u) = %f\n", bone_index, rotation_bit_rate, translation_bit_rate, k_invalid_bit_rate, transform_size, error);
 #endif
 
@@ -995,7 +997,7 @@ namespace acl
 					}
 				}
 
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_BASIC_INFO
 				printf("%u: Best bit rates: %u | %u | %u\n", bone_index, best_bit_rates.rotation, best_bit_rates.translation, best_bit_rates.scale);
 #endif
 
@@ -1065,7 +1067,7 @@ namespace acl
 
 		inline float calculate_bone_permutation_error(quantization_context& context, transform_bit_rates* permutation_bit_rates, uint8_t* bone_chain_permutation, uint32_t bone_index, transform_bit_rates* best_bit_rates, float old_error)
 		{
-			const float error_threshold = context.error_threshold;
+			const float error_threshold = context.shell_metadata_per_transform[bone_index].precision;
 			float best_error = old_error;
 
 			do
@@ -1244,12 +1246,13 @@ namespace acl
 			transform_bit_rates* best_bit_rates = allocate_type_array<transform_bit_rates>(context.allocator, context.num_bones);
 			std::memcpy(best_bit_rates, context.bit_rate_per_bone, sizeof(transform_bit_rates) * context.num_bones);
 
+			// Iterate from the root transforms first
+			// I attempted to iterate from leaves first and the memory footprint was severely worse
 			const uint32_t num_bones = context.num_bones;
-			for (uint32_t bone_index = 0; bone_index < num_bones; ++bone_index)
+			for (const uint32_t bone_index : make_iterator(context.raw_clip.sorted_transforms_parent_first, num_bones))
 			{
 				// Update our context with the new bone data
-				const float error_threshold = context.metadata[bone_index].precision;
-				context.error_threshold = error_threshold;
+				const float error_threshold = context.shell_metadata_per_transform[bone_index].precision;
 
 				const uint32_t num_bones_in_chain = calculate_bone_chain_indices(context.clip, bone_index, context.chain_bone_indices);
 				context.num_bones_in_chain = num_bones_in_chain;
@@ -1368,7 +1371,7 @@ namespace acl
 					error = best_error;
 					if (error < original_error)
 					{
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_BASIC_INFO
 						std::swap(context.bit_rate_per_bone, best_bit_rates);
 						float new_error = calculate_max_error_at_bit_rate_object(context, bone_index, error_scan_stop_condition::until_end_of_segment);
 						std::swap(context.bit_rate_per_bone, best_bit_rates);
@@ -1391,7 +1394,7 @@ namespace acl
 
 				if (error < initial_error)
 				{
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_BASIC_INFO
 					std::swap(context.bit_rate_per_bone, best_bit_rates);
 					float new_error = calculate_max_error_at_bit_rate_object(context, bone_index, error_scan_stop_condition::until_end_of_segment);
 					std::swap(context.bit_rate_per_bone, best_bit_rates);
@@ -1460,7 +1463,7 @@ namespace acl
 								best_bone_bit_rate = bone_bit_rate;
 								best_bit_rate_error = error;
 
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_BASIC_INFO
 								printf("%u: => %u %u %u (%f)\n", chain_bone_index, bone_bit_rate.rotation, bone_bit_rate.translation, bone_bit_rate.scale, error);
 								for (uint32_t i = chain_link_index + 1; i < num_bones_in_chain; ++i)
 								{
@@ -1513,13 +1516,12 @@ namespace acl
 				}
 			}
 
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_SUMMARY_ONLY
 			printf("Variable quantization optimization results:\n");
 			for (uint32_t bone_index = 0; bone_index < num_bones; ++bone_index)
 			{
 				// Update our context with the new bone data
-				const float error_threshold = context.metadata[bone_index].precision;
-				context.error_threshold = error_threshold;
+				const float error_threshold = context.shell_metadata_per_transform[bone_index].precision;
 
 				const uint32_t num_bones_in_chain = calculate_bone_chain_indices(context.clip, bone_index, context.chain_bone_indices);
 				context.num_bones_in_chain = num_bones_in_chain;
@@ -1713,14 +1715,15 @@ namespace acl
 
 						// Calculate our error
 						const uint8_t* raw_frame_transform = raw_transform + (interp_frame_index * sample_transform_size);
+
 						for (uint32_t bone_index = 0; bone_index < num_bones; ++bone_index)
 						{
-							const transform_metadata& target_bone = context.metadata[bone_index];
-
 							itransform_error_metric::calculate_error_args calculate_error_args;
 							calculate_error_args.transform0 = raw_frame_transform + (bone_index * context.metric_transform_size);
 							calculate_error_args.transform1 = context.lossy_object_pose + (bone_index * context.metric_transform_size);
-							calculate_error_args.construct_sphere_shell(target_bone.shell_distance);
+
+							const rigid_shell_metadata_t& transform_shell = context.shell_metadata_per_transform[bone_index];
+							calculate_error_args.construct_sphere_shell(transform_shell.local_shell_distance);
 
 #if defined(RTM_COMPILER_MSVC) && defined(RTM_ARCH_X86) && RTM_COMPILER_MSVC == RTM_COMPILER_MSVC_2015
 							// VS2015 fails to generate the right x86 assembly, branch instead
@@ -1777,7 +1780,7 @@ namespace acl
 
 			for (segment_context& segment : clip.segment_iterator())
 			{
-#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION
+#if ACL_IMPL_DEBUG_VARIABLE_QUANTIZATION >= ACL_IMPL_DEBUG_LEVEL_SUMMARY_ONLY
 				printf("Quantizing segment %u...\n", segment.segment_index);
 #endif
 
