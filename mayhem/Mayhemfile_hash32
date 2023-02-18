@@ -1,0 +1,6 @@
+project: acl
+target: hash32
+
+cmds:
+  - cmd: /fuzz_hash32
+    libfuzzer: true
