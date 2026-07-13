@@ -1,0 +1,29 @@
+version = 5
+
+clip =
+{
+	name = "seed"
+	num_samples = 2
+	sample_rate = 30
+}
+
+bones =
+[
+	{
+		name = "root"
+		parent = ""
+		vertex_distance = 1.0
+	}
+]
+
+tracks =
+[
+	{
+		name = "root"
+		rotations =
+		[
+			[ 0.0, 0.0, 0.0, 1.0 ]
+			[ 0.0, 0.0, 0.0, 1.0 ]
+		]
+	}
+]
